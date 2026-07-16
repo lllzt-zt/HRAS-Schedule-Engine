@@ -1051,7 +1051,7 @@ def schedule_all(tasks, cal, today, max_gap_days=5, skill_matrix=None):
             # Collect pending work for this PM
             pending = []
 
-            # 1. Ready acceptances
+            # 1. Ready acceptances (priority: HIGH - type 0)
             for task in active:
                 if task.pm_name != pm:
                     continue
@@ -1063,116 +1063,87 @@ def schedule_all(tasks, cal, today, max_gap_days=5, skill_matrix=None):
                                 cal.next_working_day(task.new_test_end) <= sim_day)
                 if accept_ready:
                     start_ord = cal.next_working_day(task.new_test_end).toordinal()
-                    pending.append((start_ord, 1, task))  # type 1 = accept
+                    pending.append((start_ord, 0, task))  # type 0 = accept (HIGH priority)
 
-            # 2. Unstarted requirement phases (for non-anchor tasks, sorted by module priority)
-                req_pending_tasks = []
-                for task in active:
-                    if task.pm_name != pm:
-                        continue
-                    if task.new_req_start is not None or task.req_wd <= 0:
-                        continue
-                    if task.is_anchor:
-                        continue  # Anchor task dates from Base, already set
-                    # Collect with sorting key: (phase_priority, module_priority, original_index)
-                    phase_pri = {"二期": 0, "三期": 1}.get(task.phase_name, 99)
-                    mp = MODULE_PRIORITY.get(task.module, 99)
-                    req_pending_tasks.append((phase_pri, mp, task.original_index, task))
-                
-                # Sort by phase priority first, then module priority, then original record order
-                req_pending_tasks.sort(key=lambda x: (x[0], x[1], x[2]))
+            # 2. Unstarted requirement phases (priority: LOW - type 1, sorted by phase+module)
+            req_pending_tasks = []
+            for task in active:
+                if task.pm_name != pm:
+                    continue
+                if task.new_req_start is not None or task.req_wd <= 0:
+                    continue
+                if task.is_anchor:
+                    continue  # Anchor task dates from Base, already set
+                phase_pri = {"二期": 0, "三期": 1}.get(task.phase_name, 99)
+                mp = MODULE_PRIORITY.get(task.module, 99)
+                req_pending_tasks.append((phase_pri, mp, task.original_index, task))
+            req_pending_tasks.sort(key=lambda x: (x[0], x[1], x[2]))
             
-            if req_pending_tasks:
-                # Take the highest-priority subsequent task
-                _, _, _, task = req_pending_tasks[0]
+            # Add req tasks to pending with type 1 (lower priority than accept type 0)
+            for _, _, _, task in req_pending_tasks:
+                pending.append((sim_day.toordinal(), 1, task))  # type 1 = req (LOW priority)
 
-                # Calculate req phase dates for subsequent task
-                # PM starts clarification at sim_day
-                pm_clarify_start = sim_day
-                # 澄清总日历工期 = ceil(迭代×3)
-                total_clarify = max(1, math.ceil(task.iterations * 3))
-                non_pm_clarify = max(1, math.ceil(total_clarify / 3))
-                pm_clarify_wd = total_clarify - non_pm_clarify
-                
-                # 澄清开始 = pm_clarify_start 倒推 non_pm_clarify wd
-                clarify_start = cal.prev_working_day(pm_clarify_start)
-                for _ in range(non_pm_clarify - 1):
-                    clarify_start = cal.prev_working_day(clarify_start)
-                
-                # ⚠️ Fix: clarify_start must NOT overlap with previous req phase's PM occupation
-                prev_busy = pm_req_busy_until.get(pm)
-                if prev_busy and clarify_start <= prev_busy:
-                    # Back-date would overlap: shift clarify forward to start after prev_busy
-                    clarify_start = cal.next_working_day(prev_busy)
-                    # Recalculate pm_clarify_start from clarify_start (forward)
-                    # Non-PM part starts at clarify_start, PM part starts after non_pm wd
-                    pm_clarify_start = cal.add_working_days(clarify_start, non_pm_clarify)
-                
-                # 澄清结束 = pm_clarify_start + pm_clarify_wd - 1wd
-                if pm_clarify_wd > 0:
-                    clarify_end = cal.add_working_days(pm_clarify_start, pm_clarify_wd)
-                else:
-                    clarify_end = pm_clarify_start
-                
-                task.new_clarify_start = clarify_start
-                task.new_clarify_end = clarify_end
-                
-                # 需求: starts after clarify ends (consecutive)
-                demand_wd = math.ceil(task.demand_md) if task.demand_md else 0
-                if demand_wd > 0:
-                    req_start = cal.next_working_day(clarify_end)
-                    req_end = cal.add_working_days(req_start, demand_wd)
-                    task.new_req_start = req_start
-                    task.new_req_end = req_end
-                else:
-                    req_end = clarify_end
-                    task.new_req_start = clarify_end
-                    task.new_req_end = clarify_end
-                
-                # 业务评审: starts at 需求结束 + 1wd（尽早开始）
-                review_wd = math.ceil(task.review_md) if task.review_md else 0
-                if review_wd > 0 and task.new_req_end:
-                    review_start = cal.next_working_day(task.new_req_end)  # 需求结束 + 1wd
-                    review_end = cal.add_working_days(review_start, review_wd)
-                    task.new_review_start = review_start
-                    task.new_review_end = review_end
-                    # 技术评审 = 业务评审结束 + 1wd
-                    task.tech_review = cal.next_working_day(review_end)
-                elif task.new_req_end:
-                    task.tech_review = cal.next_working_day(task.new_req_end)
-                    task.new_review_start = task.new_req_end
-                    task.new_review_end = task.new_req_end
-                
-                # Set the overall req phase result dates
-                # (new_req_start/end already set above for demand phase)
-                if demand_wd <= 0:
-                    task.new_req_start = task.new_clarify_start
-                    task.new_req_end = task.new_review_end if task.new_review_end else task.new_clarify_end
-                
-                # PM busy until last PM work day in req phase
-                if review_wd > 0 and task.new_review_end:
-                    pm_busy_until = task.new_review_end
-                elif demand_wd > 0 and task.new_req_end:
-                    pm_busy_until = task.new_req_end
-                else:
-                    pm_busy_until = task.new_clarify_end
-                
-                state["busy_until"] = pm_busy_until
-                state["busy_type"] = "req"
-                state["task_id"] = id(task)
-                task.pm_task_type = "req"
-                
-                # Track PM's req phase end for clarify_start overlap prevention
-                pm_req_busy_until[pm] = pm_busy_until
-                
-                pending.clear()  # Work found
-                break
-
-            # Sort: by start time first, then type (0=req before 1=accept)
+            # Sort: by start time first (earliest), then type (0=accept before 1=req)
             pending.sort(key=lambda x: (x[0], x[1]))
 
             if not pending:
                 continue
+
+            # Take the first pending item (highest priority = earliest start + accept first)
+            _, ptype, task = pending[0]
+
+            if ptype == 0:
+                # Process acceptance
+                pm_busy_until = cal.add_working_days(sim_day, task.accept_wd)
+                task.new_accept_start = sim_day
+                task.new_accept_end = cal.add_working_days(sim_day, task.accept_wd - 1)
+                state["busy_until"] = pm_busy_until
+                state["busy_type"] = "accept"
+                state["task_id"] = id(task)
+                task.pm_task_type = "accept"
+                continue
+
+            # Process req phase (ptype == 1) - generate req phase dates
+            pm_clarify_start = sim_day
+            total_clarify = max(1, math.ceil(task.iterations * 3))
+            non_pm_clarify = max(1, math.ceil(total_clarify / 3))
+            pm_clarify_wd = total_clarify - non_pm_clarify
+            clarify_start = cal.prev_working_day(pm_clarify_start)
+            for _ in range(non_pm_clarify - 1):
+                clarify_start = cal.prev_working_day(clarify_start)
+            prev_busy = pm_req_busy_until.get(pm)
+            if prev_busy and clarify_start <= prev_busy:
+                clarify_start = cal.next_working_day(prev_busy)
+                pm_clarify_start = cal.add_working_days(clarify_start, non_pm_clarify)
+            clarify_end = cal.add_working_days(pm_clarify_start, pm_clarify_wd) if pm_clarify_wd > 0 else pm_clarify_start
+            task.new_clarify_start = clarify_start
+            task.new_clarify_end = clarify_end
+            demand_wd = math.ceil(task.demand_md) if task.demand_md else 0
+            if demand_wd > 0:
+                req_start = cal.next_working_day(clarify_end)
+                req_end = cal.add_working_days(req_start, demand_wd)
+                task.new_req_start = req_start; task.new_req_end = req_end
+            else:
+                task.new_req_start = clarify_end; task.new_req_end = clarify_end
+            review_wd = math.ceil(task.review_md) if task.review_md else 0
+            if review_wd > 0 and task.new_req_end:
+                rvs = cal.next_working_day(task.new_req_end)
+                rve = cal.add_working_days(rvs, review_wd)
+                task.new_review_start = rvs; task.new_review_end = rve
+                task.tech_review = cal.next_working_day(rve)
+            elif task.new_req_end:
+                task.tech_review = cal.next_working_day(task.new_req_end)
+                task.new_review_start = task.new_req_end; task.new_review_end = task.new_req_end
+            if demand_wd <= 0:
+                task.new_req_start = task.new_clarify_start
+                task.new_req_end = task.new_review_end if task.new_review_end else task.new_clarify_end
+            pm_busy_until = task.new_review_end if (review_wd > 0 and task.new_review_end) else (task.new_req_end if demand_wd > 0 else task.new_clarify_end)
+            state["busy_until"] = pm_busy_until
+            state["busy_type"] = "req"
+            state["task_id"] = id(task)
+            task.pm_task_type = "req"
+            pm_req_busy_until[pm] = pm_busy_until
+            continue
 
             # Take the first pending work item
             _, ptype, task = pending[0]
