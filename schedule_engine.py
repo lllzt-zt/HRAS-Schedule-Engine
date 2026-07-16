@@ -890,12 +890,26 @@ def schedule_all(tasks, cal, today, max_gap_days=5, skill_matrix=None):
     pm_req_queue = defaultdict(list)
 
     # Initialize PM state and req queues for each PM
+    # pm_req_busy_until tracks the end of PM's LAST req phase occupation (persistent across sim days)
+    # Initialize from anchor task dates so Phase 2/3 tasks respect Phase 1+anchor PM occupation
+    pm_req_busy_until = {}
     for task in active:
         pm = task.pm_name
         if pm:
             if pm not in pm_state:
                 pm_state[pm] = {"busy_until": None, "busy_type": None, "task_id": None}
             pm_req_queue[pm].append(task)
+            # If anchor task has req phase dates, set pm_req_busy_until to the latest req phase end
+            if task.is_anchor or task.new_req_start is not None:
+                req_end = None
+                if task.new_review_end:
+                    req_end = task.new_review_end
+                elif task.new_req_end:
+                    req_end = task.new_req_end
+                elif task.new_clarify_end:
+                    req_end = task.new_clarify_end
+                if req_end and (pm not in pm_req_busy_until or req_end > pm_req_busy_until[pm]):
+                    pm_req_busy_until[pm] = req_end
 
     # Sort each PM's req queue: anchor first, then by module priority, then by record order
     for pm, queue in pm_req_queue.items():
@@ -1052,24 +1066,25 @@ def schedule_all(tasks, cal, today, max_gap_days=5, skill_matrix=None):
                     pending.append((start_ord, 1, task))  # type 1 = accept
 
             # 2. Unstarted requirement phases (for non-anchor tasks, sorted by module priority)
-            req_pending_tasks = []
-            for task in active:
-                if task.pm_name != pm:
-                    continue
-                if task.new_req_start is not None or task.req_wd <= 0:
-                    continue
-                if task.is_anchor:
-                    continue  # Anchor task dates from Base, already set
-                # Collect with sorting key: (module_priority, original_index)
-                mp = MODULE_PRIORITY.get(task.module, 99)
-                req_pending_tasks.append((mp, task.original_index, task))
-            
-            # Sort by module priority first, then original record order
-            req_pending_tasks.sort(key=lambda x: (x[0], x[1]))
+                req_pending_tasks = []
+                for task in active:
+                    if task.pm_name != pm:
+                        continue
+                    if task.new_req_start is not None or task.req_wd <= 0:
+                        continue
+                    if task.is_anchor:
+                        continue  # Anchor task dates from Base, already set
+                    # Collect with sorting key: (phase_priority, module_priority, original_index)
+                    phase_pri = {"二期": 0, "三期": 1}.get(task.phase_name, 99)
+                    mp = MODULE_PRIORITY.get(task.module, 99)
+                    req_pending_tasks.append((phase_pri, mp, task.original_index, task))
+                
+                # Sort by phase priority first, then module priority, then original record order
+                req_pending_tasks.sort(key=lambda x: (x[0], x[1], x[2]))
             
             if req_pending_tasks:
                 # Take the highest-priority subsequent task
-                _, _, task = req_pending_tasks[0]
+                _, _, _, task = req_pending_tasks[0]
 
                 # Calculate req phase dates for subsequent task
                 # PM starts clarification at sim_day
@@ -1083,6 +1098,15 @@ def schedule_all(tasks, cal, today, max_gap_days=5, skill_matrix=None):
                 clarify_start = cal.prev_working_day(pm_clarify_start)
                 for _ in range(non_pm_clarify - 1):
                     clarify_start = cal.prev_working_day(clarify_start)
+                
+                # ⚠️ Fix: clarify_start must NOT overlap with previous req phase's PM occupation
+                prev_busy = pm_req_busy_until.get(pm)
+                if prev_busy and clarify_start <= prev_busy:
+                    # Back-date would overlap: shift clarify forward to start after prev_busy
+                    clarify_start = cal.next_working_day(prev_busy)
+                    # Recalculate pm_clarify_start from clarify_start (forward)
+                    # Non-PM part starts at clarify_start, PM part starts after non_pm wd
+                    pm_clarify_start = cal.add_working_days(clarify_start, non_pm_clarify)
                 
                 # 澄清结束 = pm_clarify_start + pm_clarify_wd - 1wd
                 if pm_clarify_wd > 0:
@@ -1137,6 +1161,9 @@ def schedule_all(tasks, cal, today, max_gap_days=5, skill_matrix=None):
                 state["busy_type"] = "req"
                 state["task_id"] = id(task)
                 task.pm_task_type = "req"
+                
+                # Track PM's req phase end for clarify_start overlap prevention
+                pm_req_busy_until[pm] = pm_busy_until
                 
                 pending.clear()  # Work found
                 break

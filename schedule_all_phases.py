@@ -21,7 +21,7 @@ def d(rec,fid): x=v(rec,fid); return x[:10] if x and isinstance(x,str) else None
 def s(rec,fid): x=v(rec,fid); return x[0] if isinstance(x,list) and x else ''
 
 ORIGINAL_ANCHORS = {"【移动端】出勤管理":1,"【考勤】商旅平台对接（排期只是暂定）":1,
-    "【奖金补贴】社保公积金、福利补贴、奖金管理":1,"【报表】薪酬报表":1,
+    "【奖金补贴】社保公积金、福利补贴、奖金管理":1,
     "员工多档案视图（不同国家、不同用工）":1,"工作台重塑（基于角色和事项）PC端":1,
     "工作台重塑（基于角色和事项）移动端":1}
 
