@@ -901,8 +901,9 @@ def schedule_all(tasks, cal, today, max_gap_days=5, skill_matrix=None):
     for pm, queue in pm_req_queue.items():
         queue.sort(key=lambda t: (
             0 if t.is_anchor else 1,  # Anchor first
-            MODULE_PRIORITY.get(t.module, 99),  # Module priority (v4: not tech_review!)
-            t.original_index  # Within same module, by Base record order
+            {"二期": 0, "三期": 1}.get(t.phase_name, 99),  # Phase priority: ALL 二 before 三
+            MODULE_PRIORITY.get(t.module, 99),  # Within same phase, by module priority
+            t.original_index  # Within same module & phase, by Base record order
         ))
 
     # v4: For anchor task, set new_* req phase fields from Base dates
